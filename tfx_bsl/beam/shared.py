@@ -205,8 +205,10 @@ class Shared(object):
   # TODO(b/160177343): Consider allowing users to also pass in a key (GUID)
   # for more easily sharing of identifiable expensive objects. User would be
   # responsible for handling collisions.
-  def __init__(self):
-    self._key = _shared_map.make_key()
+  def __init__(self, key=None):
+    if key is None:
+      key = _shared_map.make_key()
+    self._key = key
 
   def acquire(self, constructor_fn: Callable[[], Any]) -> Any:
     """Acquire a reference to the object associated with this Shared handle.

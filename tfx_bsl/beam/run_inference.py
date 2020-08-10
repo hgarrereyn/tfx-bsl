@@ -162,16 +162,14 @@ def _RunInferenceCore(
   Raises:
     ValueError: when operation is not supported.
   """
-  batched_queries = queries | 'BatchQueries' >> _BatchQueries()
+  # batched_queries = queries | 'BatchQueries' >> _BatchQueries()
+  batched_queries = queries
   predictions = None
 
   if fixed_inference_spec_type is None:
     # operation type is determined at runtime
     tagged = (
-      batched_queries | 'TagByOperation' >> beam.Map(
-        lambda batch: beam.pvalue.TaggedOutput(
-          _get_operation_type(batch[0]), batch)
-      )
+      batched_queries | 'TagByOperation' >> beam.ParDo(_TagByOperation(shared.Shared('tag')))
       .with_outputs(
         OperationType.CLASSIFICATION,
         OperationType.REGRESSION,
@@ -206,6 +204,35 @@ def _RunInferenceCore(
       raise ValueError('Unsupported operation_type %s' % operation_type)
 
   return predictions
+
+
+class MAP(object):
+  def __init__(self):
+    self.m = {}
+
+
+class _TagByOperation(beam.DoFn):
+  def __init__(self, shared):
+    self._shared = shared
+    self._map = None
+
+  def setup(self):
+    def load():
+      return MAP() # serialized -> (operation_type)
+    self._map = self._shared.acquire(load)
+
+  def process(self, q):
+    key = q[0].SerializeToString()
+    op = None
+    if key in self._map.m:
+      logging.info('cache')
+      op = self._map.m[key]
+    else:
+      op = _get_operation_type(q[0])
+      self._map.m[key] = op
+      logging.info('put')
+
+    return [beam.pvalue.TaggedOutput(op, q)]
 
 
 @beam.ptransform_fn
@@ -952,7 +979,7 @@ def _BuildInferenceOperation(
     NotImplementedError: if remote inference is attempted and not supported.
   """
   @beam.ptransform_fn
-  @beam.typehints.with_input_types(_QueryBatchType)
+  @beam.typehints.with_input_types(QueryType)
   @beam.typehints.with_output_types(prediction_log_pb2.PredictionLog)
   def _Op(
       pcoll: beam.pvalue.PCollection,
@@ -965,12 +992,14 @@ def _BuildInferenceOperation(
 
       in_process_result = (
         tagged['in_process']
+        | '_BatchQueriesInProcess' >> _BatchQueries()
         | ('InProcess%s' % name) >> beam.ParDo(
           in_process_dofn(shared.Shared())))
 
       if remote_dofn:
         remote_result = (
           tagged['remote']
+          | '_BatchQueriesRemote' >> _BatchQueries()
           | ('Remote%s' % name) >> beam.ParDo(
             remote_dofn(pcoll.pipeline.options)))
 
@@ -984,6 +1013,7 @@ def _BuildInferenceOperation(
       if _using_in_process_inference(fixed_inference_spec_type):
         raw_result = (
           pcoll
+          | '_BatchQueries' >> _BatchQueries()
           | ('InProcess%s' % name) >> beam.ParDo(in_process_dofn(
             shared.Shared(),
             fixed_inference_spec_type=fixed_inference_spec_type)))
@@ -991,6 +1021,7 @@ def _BuildInferenceOperation(
         if remote_dofn:
           raw_result = (
             pcoll
+            | '_BatchQueries' >> _BatchQueries()
             | ('Remote%s' % name) >> beam.ParDo(remote_dofn(
               pcoll.pipeline.options,
               fixed_inference_spec_type=fixed_inference_spec_type)))
